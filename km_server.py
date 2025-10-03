@@ -1,84 +1,92 @@
 """
-km_server.py — Simple Key Manager (FastAPI)
-- identity register/fetch
-- sessions (QKD-sim) request & fetch
-- otp request & fetch
-- stores data in JSON files under ~/.qumail_km (simple for demo)
+km_server.py — Key Manager (FastAPI + Postgres via SQLAlchemy)
+- Register/fetch identities
+- Sessions (QKD-sim)
+- OTP one-time pads
+- Uses DATABASE_URL (Postgres on Render) or falls back to SQLite
 """
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Depends
 from pydantic import BaseModel
-from typing import List, Dict, Optional
-import os, json, time, base64, secrets, threading
+from typing import List, Optional
+from sqlalchemy import create_engine, Column, String, Integer, Boolean, JSON
+from sqlalchemy.orm import sessionmaker, declarative_base, Session
+import os, time, base64, secrets
 
-APP_DIR = os.path.join(os.path.expanduser("~"), ".qumail_km")
-os.makedirs(APP_DIR, exist_ok=True)
-IDENT_PATH = os.path.join(APP_DIR, "identities.json")
-SESS_PATH = os.path.join(APP_DIR, "sessions.json")
-OTP_PATH = os.path.join(APP_DIR, "otps.json")
-LOCK = threading.Lock()
+# -------------------------------------------------------------------
+# Database setup
+# -------------------------------------------------------------------
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./km.db")
 
-def _load(p, default):
-    if not os.path.exists(p):
-        return default
+engine = create_engine(DATABASE_URL, echo=False, future=True)
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+Base = declarative_base()
+
+def get_db():
+    db = SessionLocal()
     try:
-        with open(p, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return default
+        yield db
+    finally:
+        db.close()
 
-def _save(p, data):
-    with open(p + ".tmp", "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-    os.replace(p + ".tmp", p)
+# -------------------------------------------------------------------
+# Models
+# -------------------------------------------------------------------
+class Identity(Base):
+    __tablename__ = "identities"
+    email = Column(String, primary_key=True, index=True)
+    pubkey = Column(String)
+    alg = Column(String, default="kyber")
+    created_at = Column(Integer, default=lambda: int(time.time()))
 
-# storage
-def load_all():
-    with LOCK:
-        idents = _load(IDENT_PATH, {})
-        sess = _load(SESS_PATH, {})
-        otps = _load(OTP_PATH, {})
-        return idents, sess, otps
+class SessionModel(Base):
+    __tablename__ = "sessions"
+    id = Column(String, primary_key=True, index=True)
+    data = Column(JSON)
 
-def save_all(idents, sess, otps):
-    with LOCK:
-        _save(IDENT_PATH, idents)
-        _save(SESS_PATH, sess)
-        _save(OTP_PATH, otps)
+class OTPModel(Base):
+    __tablename__ = "otps"
+    id = Column(String, primary_key=True, index=True)
+    data = Column(JSON)
 
+Base.metadata.create_all(bind=engine)
+
+# -------------------------------------------------------------------
+# FastAPI app
+# -------------------------------------------------------------------
 app = FastAPI()
 
 class RegisterModel(BaseModel):
     email: str
     pubkey: str
-    alg: Optional[str] = "kyber"  # metadata
+    alg: Optional[str] = "kyber"
 
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
 @app.post("/api/keys/register")
-def register_key(payload: RegisterModel):
-    idents, sess, otps = load_all()
-    idents[payload.email.lower()] = {
-        "pubkey": payload.pubkey,
-        "alg": payload.alg,
-        "created_at": int(time.time()),
-    }
-    save_all(idents, sess, otps)
+def register_key(payload: RegisterModel, db: Session = Depends(get_db)):
+    identity = Identity(
+        email=payload.email.lower(),
+        pubkey=payload.pubkey,
+        alg=payload.alg,
+        created_at=int(time.time())
+    )
+    db.merge(identity)  # upsert
+    db.commit()
     return {"status": "ok"}
 
 @app.get("/api/keys/identity/{email}")
-def get_identity(email: str, scheme: Optional[str] = Query(None)):
-    idents, sess, otps = load_all()
-    e = email.lower()
-    if e not in idents:
+def get_identity(email: str, db: Session = Depends(get_db)):
+    identity = db.query(Identity).filter(Identity.email == email.lower()).first()
+    if not identity:
         raise HTTPException(status_code=404, detail="recipient key not found")
-    entry = idents[e].copy()
-    # optionally support aes key if present
-    return {"pubkey": entry.get("pubkey"), "alg": entry.get("alg")}
+    return {"pubkey": identity.pubkey, "alg": identity.alg}
 
-# sessions for QKD-sim (ephemeral AES keys)
+# -------------------------------------------------------------------
+# Sessions (QKD-sim)
+# -------------------------------------------------------------------
 class SessionRequest(BaseModel):
     sender: str
     recipients: List[str]
@@ -86,15 +94,14 @@ class SessionRequest(BaseModel):
     one_time: Optional[bool] = True
 
 @app.post("/api/sessions/request")
-def request_session(req: SessionRequest):
-    idents, sess, otps = load_all()
+def request_session(req: SessionRequest, db: Session = Depends(get_db)):
     ses_id = f"ses-{int(time.time())}-{secrets.token_hex(6)}"
     aes_map = {}
     for r in req.recipients:
-        # per-recipient AES key (base64)
         key = secrets.token_bytes(32)
         aes_map[r.lower()] = base64.b64encode(key).decode("ascii")
-    sess[ses_id] = {
+
+    sess_entry = {
         "aes_map": aes_map,
         "recipients": [r.lower() for r in req.recipients],
         "created_at": int(time.time()),
@@ -102,64 +109,81 @@ def request_session(req: SessionRequest):
         "one_time": bool(req.one_time),
         "consumed": {r.lower(): False for r in req.recipients}
     }
-    save_all(idents, sess, otps)
+
+    db.add(SessionModel(id=ses_id, data=sess_entry))
+    db.commit()
     return {"session_id": ses_id, "aes_map": aes_map}
 
 @app.get("/api/sessions/{session_id}")
-def get_session_key(session_id: str, recipient: str):
-    idents, sess, otps = load_all()
-    s = sess.get(session_id)
+def get_session_key(session_id: str, recipient: str, db: Session = Depends(get_db)):
+    s = db.query(SessionModel).filter(SessionModel.id == session_id).first()
     if not s:
         raise HTTPException(status_code=404, detail="session not found")
-    if recipient.lower() not in s["recipients"]:
+
+    data = s.data
+    if recipient.lower() not in data["recipients"]:
         raise HTTPException(status_code=403, detail="not a recipient")
+
     # TTL check
-    if int(time.time()) - s["created_at"] > s["ttl"]:
+    if int(time.time()) - data["created_at"] > data["ttl"]:
         raise HTTPException(status_code=410, detail="session expired")
-    if s["one_time"] and s["consumed"].get(recipient.lower(), False):
+
+    if data["one_time"] and data["consumed"].get(recipient.lower(), False):
         raise HTTPException(status_code=410, detail="session key consumed")
-    key = s["aes_map"].get(recipient.lower())
-    if s["one_time"]:
-        s["consumed"][recipient.lower()] = True
-        save_all(idents, sess, otps)
+
+    key = data["aes_map"].get(recipient.lower())
+    if data["one_time"]:
+        data["consumed"][recipient.lower()] = True
+        s.data = data
+        db.commit()
+
     return {"aes_key_b64": key}
 
-# OTP endpoints
+# -------------------------------------------------------------------
+# OTP (One-time pads)
+# -------------------------------------------------------------------
 class OTPRequest(BaseModel):
     sender: str
     recipients: List[str]
     length_bytes: int
 
 @app.post("/api/otp/request")
-def request_otp(req: OTPRequest):
+def request_otp(req: OTPRequest, db: Session = Depends(get_db)):
     if req.length_bytes > 20000:
-        raise HTTPException(status_code=400, detail="OTP length too large for demo (limit 20KB)")
-    idents, sess, otps = load_all()
+        raise HTTPException(status_code=400, detail="OTP length too large (max 20KB)")
+
     otp_id = f"otp-{int(time.time())}-{secrets.token_hex(6)}"
     map_ = {}
     for r in req.recipients:
         data = secrets.token_bytes(req.length_bytes)
         map_[r.lower()] = base64.b64encode(data).decode("ascii")
-    otps[otp_id] = {
+
+    otp_entry = {
         "map": map_,
         "recipients": [r.lower() for r in req.recipients],
         "created_at": int(time.time()),
-        "consumed": {r.lower(): False for r in req.recipients},
+        "consumed": {r.lower(): False for r in req.recipients}
     }
-    save_all(idents, sess, otps)
+
+    db.add(OTPModel(id=otp_id, data=otp_entry))
+    db.commit()
     return {"otp_id": otp_id, "for": list(map_.keys())}
 
 @app.get("/api/otp/{otp_id}")
-def get_otp(otp_id: str, recipient: str):
-    idents, sess, otps = load_all()
-    o = otps.get(otp_id)
+def get_otp(otp_id: str, recipient: str, db: Session = Depends(get_db)):
+    o = db.query(OTPModel).filter(OTPModel.id == otp_id).first()
     if not o:
         raise HTTPException(status_code=404, detail="otp not found")
-    if recipient.lower() not in o["recipients"]:
+
+    data = o.data
+    if recipient.lower() not in data["recipients"]:
         raise HTTPException(status_code=403, detail="not a recipient")
-    if o["consumed"].get(recipient.lower(), False):
+
+    if data["consumed"].get(recipient.lower(), False):
         raise HTTPException(status_code=410, detail="otp consumed")
-    data_b64 = o["map"].get(recipient.lower())
-    o["consumed"][recipient.lower()] = True
-    save_all(idents, sess, otps)
+
+    data_b64 = data["map"].get(recipient.lower())
+    data["consumed"][recipient.lower()] = True
+    o.data = data
+    db.commit()
     return {"otp_b64": data_b64}
