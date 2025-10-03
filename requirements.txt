@@ -1,6 +1,5 @@
-cryptography
-requests
 fastapi
 uvicorn
+pydantic
 sqlalchemy
-python-dotenv
+psycopg2-binary
