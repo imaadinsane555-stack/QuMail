@@ -24,7 +24,7 @@ from qumail_ai import summarize_text, detect_spam, text_to_speech, speech_to_tex
 # ---------------- Config ----------------
 CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".qumail")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
-KM_DEFAULT = "http://127.0.0.1:5000"
+KM_DEFAULT = "https://qumail-8iq6.onrender.com"
 
 if not os.path.exists(CONFIG_DIR):
     os.makedirs(CONFIG_DIR)
