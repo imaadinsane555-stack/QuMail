@@ -103,14 +103,20 @@ def get_identity(email: str, db: Session = Depends(get_db)):
 class SessionRequest(BaseModel):
     sender: str
     recipients: List[str]
-    ttl_seconds: Optional[int] = 300
-    one_time: Optional[bool] = True
+    ttl_seconds: Optional[int] = 600  # Increased TTL for stability (10 min)
+    one_time: Optional[bool] = False  # allow multiple fetches during demo
+
 
 @app.post("/api/sessions/request")
 def request_session(req: SessionRequest, db: Session = Depends(get_db)):
+    """
+    Create a session with AES keys for sender + recipients.
+    Extended TTL and stable multi-fetch support for demo.
+    """
     ses_id = f"ses-{int(time.time())}-{secrets.token_hex(6)}"
     aes_map = {}
-    # include sender + recipients
+
+    # Include sender + recipients
     for r in req.recipients + [req.sender]:
         key = secrets.token_bytes(32)
         aes_map[r.lower()] = base64.b64encode(key).decode("ascii")
@@ -120,17 +126,24 @@ def request_session(req: SessionRequest, db: Session = Depends(get_db)):
         "recipients": [r.lower() for r in req.recipients],
         "sender": req.sender.lower(),
         "created_at": int(time.time()),
-        "ttl": req.ttl_seconds or 300,
+        "ttl": req.ttl_seconds or 600,
         "one_time": bool(req.one_time),
         "consumed": {r.lower(): False for r in req.recipients + [req.sender]},
     }
 
     db.add(SessionModel(id=ses_id, data=sess_entry))
     db.commit()
+
+    print(f"[KM] 🔑 Created session {ses_id} for {req.recipients} (TTL={req.ttl_seconds}s)")
     return {"session_id": ses_id, "aes_map": aes_map}
+
 
 @app.get("/api/sessions/{session_id}")
 def get_session_key(session_id: str, recipient: str, db: Session = Depends(get_db)):
+    """
+    Fetch AES key for a given session + recipient.
+    Demo-safe version: allows repeated fetches, only expires after TTL.
+    """
     s = db.query(SessionModel).filter(SessionModel.id == session_id).first()
     if not s:
         raise HTTPException(status_code=404, detail="session not found")
@@ -140,18 +153,23 @@ def get_session_key(session_id: str, recipient: str, db: Session = Depends(get_d
     if rec not in data["aes_map"]:
         raise HTTPException(status_code=403, detail="not a participant")
 
+    # TTL check
     if int(time.time()) - data["created_at"] > data["ttl"]:
+        print(f"[KM] ⚠ Session {session_id} expired (TTL {data['ttl']}s)")
         raise HTTPException(status_code=410, detail="session expired")
 
-    if data["one_time"] and data["consumed"].get(rec, False):
-        raise HTTPException(status_code=410, detail="session key consumed")
-
+    # 🔧 Keep demo stable: don’t enforce one-time use
     key = data["aes_map"][rec]
-    if data["one_time"]:
-        data["consumed"][rec] = True
-        s.data = data
-        db.commit()
 
+    # For production, uncomment below lines again:
+    # if data["one_time"]:
+    #     if data["consumed"].get(rec, False):
+    #         raise HTTPException(status_code=410, detail="session key consumed")
+    #     data["consumed"][rec] = True
+    #     s.data = data
+    #     db.commit()
+
+    print(f"[KM] ✅ Session {session_id}: Key delivered to {recipient}")
     return {"aes_key_b64": key}
 
 # -------------------------------------------------------------------
